@@ -13,7 +13,8 @@ import os
 
 import torch
 
-from .kernels import cond_copy_rows, gdn_replay, gdn_verify
+from .kernels import (cond_copy_rows, gdn_replay, gdn_replay_from, gdn_verify, gdn_verify_deferred,
+                      gdn_verify_slots)
 
 
 class Rollback:
@@ -581,11 +582,434 @@ class OracleCopyStatic(OracleStatic):
                     oracle_trace=self.trace_path)
 
 
+
+class SlotStoreStatic(ConfKStatic):
+    """Base of the fixed-slot and oracle-slot strategies below (youngjoon, 10/24). The verify kernel writes the kept
+    rows into `ns` slots per sequence -- fp32 (bits 32), or 8-bit / 4-bit (symmetric, one fp32 scale per q_group key
+    rows of each value column; None = per value channel), the kept rows being read once per sequence before the token
+    loop (gdn_verify_slots; no per-token slot map) -- and the restore is one fused kernel per GDN layer
+    (gdn_replay_from): each row starts from its largest kept row <= A-1 (or from S_0) and replays the rest, so the
+    snapshot is read once and the durable state written once (no separate copy pass)."""
+    needs_confidence = False
+    bits = 32
+    q_group = None
+
+    def __init__(self, engine, bs, block, slots=1):
+        Rollback.__init__(self, engine, bs, block)
+        e = engine
+        hv, kd, vd = e.rec[e.gdn[0]].shape[1:]
+        self.select, self.k, self.thr, self.ns = "slots", slots, None, slots
+        if self.bits in (4, 8):
+            self.group = self.q_group or kd
+            dt = torch.uint8 if self.bits == 4 else torch.int16          # two key rows per element
+            self.snap_rec = {i: torch.empty(bs, slots, hv, kd // 2, vd, device=e.dev, dtype=dt) for i in e.gdn}
+            self.snap_scale = {i: torch.empty(bs, slots, hv, kd // self.group, vd, device=e.dev) for i in e.gdn}
+        else:
+            assert self.bits == 32
+            self.group = None
+            self.snap_rec = {i: torch.empty(bs, slots, hv, kd, vd, device=e.dev, dtype=e.rec[i].dtype) for i in e.gdn}
+            self.snap_scale = None
+        self.inputs, self.conv_full, self.events, self.capture = {}, {}, [], None
+        self.slot_map = self.rows = None
+        self.reset_stats()
+
+    def buffer_bytes(self):
+        b = super().buffer_bytes()
+        sc = sum(x.numel() * x.element_size() for x in (self.snap_scale or {}).values())
+        return dict(b, rec_bytes=b["rec_bytes"] + sc, total_bytes=b["total_bytes"] + sc, bits=self.bits, q_group=self.group)
+
+    def verify_gdn(self, i, q, k, v, g, beta, conv_full, n):
+        e0 = self._ev()
+        if i == self.eng.gdn[0]:                                     # one int32 copy of the kept rows per step
+            self.rows32 = self.rows.to(torch.int32).contiguous()
+        o = gdn_verify_slots(q, k, v, g, beta, self.eng.rec[i][:n], self.snap_rec[i][:n], self.rows32,
+                             self.snap_scale[i][:n] if self.snap_scale else None)
+        self._ev_end(e0)
+        self.inputs[i] = (k, v, g, beta)
+        self.conv_full[i] = conv_full
+        if self.capture is not None:
+            self.capture[i] = (q, k, v, g, beta)
+        return o
+
+    def restore(self, produced, n, accepted=None):
+        dev = produced.device
+        last = (produced - 1)[:, None]
+        cand = torch.where((self.rows >= 0) & (self.rows <= last), self.rows, -1)
+        best, slot = cand.max(1)
+        have = best >= 0
+        src = torch.where(have, torch.arange(n, device=dev) * self.ns + slot, -1)
+        offs = torch.where(have, best + 1, 0)
+        lens = produced - offs
+        km1 = self.eng.conv[self.eng.gdn[0]].shape[-1]
+        widx = (produced[:, None] + torch.arange(km1, device=dev)[None])[:, None, :]
+        for i in self.snap_rec:
+            k, v, g, beta = self.inputs[i]
+            gdn_replay_from(k, v, g, beta, self.eng.rec[i][:n], offs, lens, src, self.snap_rec[i][:n].flatten(0, 1),
+                            self.snap_scale[i][:n].flatten(0, 1) if self.snap_scale else None)
+            full = self.conv_full[i]
+            torch.gather(full, 2, widx.expand(-1, full.shape[1], -1), out=self.eng.conv[i][:n])
+        self.inputs, self.conv_full = {}, {}
+        valid = torch.arange(n, device=dev) < self.eng.n_dev
+        vl = valid.long()
+        self.stat["n"] += vl.sum()
+        self.stat["hit"] += ((lens == 0) & valid).sum()
+        self.stat["from_s0"] += ((~have) & valid).sum()
+        self.stat["replay"] += (lens * vl).sum()
+        self.stat["replay_hist"].index_add_(0, lens, vl)
+
+    def pred_stats(self):
+        return dict(super().pred_stats(), bits=self.bits, q_group=self.group)
+
+
+class FixedSlotsStatic(SlotStoreStatic):
+    """Snapshots at fixed acceptance lengths (als=(6,): the state after 6 committed tokens), the same for every row
+    and step: no position prediction. A < smallest kept AL: replay from S_0."""
+    name = "fixed"
+
+    def __init__(self, engine, bs, block, als=(6,)):
+        als = sorted({int(a) for a in als})
+        assert all(1 <= a <= block for a in als), als
+        super().__init__(engine, bs, block, slots=len(als))
+        dev = engine.dev
+        rows = torch.tensor([a - 1 for a in als], device=dev)
+        smap = torch.full((block,), -1, dtype=torch.int32, device=dev)
+        smap[rows] = torch.arange(self.ns, dtype=torch.int32, device=dev)
+        self.rows_all = rows.expand(bs, -1).contiguous()
+        self.smap_all = smap.expand(bs, -1).contiguous()
+        self.als = als
+
+    def pre_verify(self, n):
+        self.rows, self.slot_map = self.rows_all[:n], self.smap_all[:n]
+
+    def pred_stats(self):
+        return dict(super().pred_stats(), als=self.als)
+
+
+class FixedSlotsQ4(FixedSlotsStatic):
+    name = "fixed_q4"
+    bits = 4
+
+
+class FixedSlotsQ8(FixedSlotsStatic):
+    name = "fixed_q8"
+    bits = 8
+
+
+class OracleSlotStatic(_Oracle, SlotStoreStatic):
+    """oracle with the fused restore; a wrong oracle (e.g. once 4-bit snapshots changed the output and the recorded
+    trace no longer applies) still restores exactly from S_0 (counted in hit_rate). check_oracle() keeps, per step,
+    whether each row's oracle was right (host side, after the timed step), so step times can be split by hit."""
+    name = "oracle_fused"
+
+    def reset_stats(self):
+        super().reset_stats()
+        self.hit_trace = []
+
+    def check_oracle(self, prod):
+        self.hit_trace.append([int(self.oracle_host[r]) == a for r, a in enumerate(prod)])
+
+    def pred_stats(self):
+        return dict(super().pred_stats(), oracle_hit_trace=self.hit_trace)
+
+
+class OracleSlotQ4(OracleSlotStatic):
+    name = "oracle_fused_q4"
+    bits = 4
+
+
+class OracleSlotQ8(OracleSlotStatic):
+    name = "oracle_fused_q8"
+    bits = 8
+
+
+
+class ExpCostSlotStatic(SlotStoreStatic):
+    """Our position-prediction methods on 8-bit snapshots (youngjoon, 10/24). From a predicted distribution of the
+    acceptance length P(A), A = 1..S, each sequence keeps the one block row r that minimises the expected rollback
+    cost, or none when recomputation (SpecLA) is expected to be cheaper:
+        E[none] = sum_A P(A) rep(A)
+        E[r]    = W + sum_{A <= r} P(A) rep(A) + sum_{A > r} P(A) fused(A - 1 - r)
+    rep(n): replay n tokens from S_0; fused(m): read the 8-bit snapshot + replay m tokens; W: the snapshot write in
+    verify. GPU kernel times per GDN layer from q4/test_q4.py --full --json (closest measured batch size)."""
+    bits = 8
+
+    def __init__(self, engine, bs, block, cost_table=None):
+        super().__init__(engine, bs, block, slots=1)
+        tabs = json.load(open(cost_table))
+        t = tabs[min(tabs, key=lambda b: abs(int(b) - bs))]
+        S = block
+        rep = [t[f"replay {a} tok from S0"] for a in range(1, S + 1)]
+        kind = "fp32" if self.bits == 32 else f"{self.bits}bit"
+        fus = [t[f"fused {kind} snap + {m} tok"] for m in range(S)]
+        w = sum(t[f"verify_slots {kind} (AL {a})"] for a in (2, 6, 12)) / 3 - t["verify, no store"]
+        C = torch.empty(S, S + 1)                           # [A - 1, choice]; choice 0 = no snapshot, r + 1 = row r
+        for A in range(1, S + 1):
+            C[A - 1, 0] = rep[A - 1]
+            for r in range(S):
+                C[A - 1, r + 1] = w + (rep[A - 1] if A <= r else fus[A - 1 - r])
+        self.cost = C.to(engine.dev)
+        self.cost_table, self.cost_batch = cost_table, int(min(tabs, key=lambda b: abs(int(b) - bs)))
+        z = lambda: torch.zeros((), dtype=torch.long, device=engine.dev)  # noqa: E731
+        self.stat2 = dict(none=z(), rowsum=z(), n=z())
+
+    def reset_stats(self):
+        super().reset_stats()
+        for x in getattr(self, "stat2", {}).values():
+            x.zero_()
+
+    def choose(self, P):
+        """P [n, S] over A = 1..S -> self.rows [n, 1] (kept block row, -1 = none)."""
+        ch = (P @ self.cost).argmin(1)
+        self.rows = (ch - 1)[:, None]
+        self.slot_map = None
+        n = P.shape[0]
+        valid = (torch.arange(n, device=P.device) < self.eng.n_dev).long()
+        self.stat2["n"] += valid.sum()
+        self.stat2["none"] += ((ch == 0).long() * valid).sum()
+        self.stat2["rowsum"] += ((ch - 1).clamp(min=0) * valid).sum()
+
+    @staticmethod
+    def al_dist(conf):
+        """Draft confidences c_1..c_{S-1} [n, S-1] -> P(A) [n, S]: P(A >= a) = c_1 ... c_{a-1}."""
+        surv = torch.cat([torch.ones_like(conf[:, :1]), torch.cumprod(conf, 1)], 1)       # P(A >= 1..S)
+        return surv - torch.cat([surv[:, 1:], torch.zeros_like(surv[:, :1])], 1)
+
+    def pred_stats(self):
+        st = {k: int(v) for k, v in self.stat2.items()}
+        m = max(st["n"], 1)
+        return dict(super().pred_stats(), cost_table=self.cost_table, cost_batch=self.cost_batch,
+                    no_snapshot_rate=st["none"] / m, mean_kept_row=st["rowsum"] / max(st["n"] - st["none"], 1))
+
+
+class HistCostStatic(ExpCostSlotStatic):
+    """Statistics method (most-frequent-AL family): P(A) = online histogram of the observed acceptance lengths
+    (device, updated inside the captured step; uniform prior of one count per A), the same row for every sequence.
+    (Named al_counts: run_all treats an attribute "hist" as modeal's.)"""
+    name = "hist_q8"
+    needs_confidence = False
+
+    def __init__(self, engine, bs, block, cost_table=None):
+        super().__init__(engine, bs, block, cost_table)
+        self.al_counts = torch.ones(block, device=engine.dev)
+
+    def reset_stats(self):
+        super().reset_stats()
+        if hasattr(self, "al_counts"):
+            self.al_counts.fill_(1.0)
+
+    def pre_verify(self, n):
+        self.choose((self.al_counts / self.al_counts.sum())[None].expand(n, -1))
+
+    def restore(self, produced, n, accepted=None):
+        super().restore(produced, n, accepted)
+        valid = (torch.arange(n, device=produced.device) < self.eng.n_dev).float()
+        a = accepted if accepted is not None else produced
+        self.al_counts.index_add_(0, (a - 1).clamp(0, self.S - 1), valid)
+
+
+class SoftmaxCostStatic(ExpCostSlotStatic):
+    """softmax method: c_k = draft softmax probability of its own token, computed with the argmax in one pass over
+    the logits (engine need_conf "fused"), P(A) from c_1..c_{S-1}."""
+    name = "confsm_q8"
+    needs_confidence = "fused"
+
+    def predict(self, conf):
+        self.choose(self.al_dist(conf.float()))
+
+
+class HeadCostStatic(ExpCostSlotStatic):
+    """learned-head method: c_k from the conf-K method B head on the draft hidden state, P(A) from c_1..c_{S-1}."""
+    name = "confhead_q8"
+    needs_confidence = "hidden"
+    confidence = _ConfHead.confidence
+
+    def __init__(self, engine, bs, block, cost_table=None, head=None):
+        super().__init__(engine, bs, block, cost_table)
+        self.head_path = head
+        self.head = load_conf_head(head, engine.dev)
+
+    def predict(self, conf):
+        self.choose(self.al_dist(conf.float()))
+
+
+class _Deferred(SlotStoreStatic):
+    """Deferred restore (youngjoon, 10/24): restore() only records, per row, where the committed state starts (its
+    kept snapshot slot, or S_0 = engine.rec) and which block tokens remain to be replayed; the next step's verify kernel
+    (gdn_verify_deferred) does that replay in registers, writes the committed state to engine.rec once and goes on
+    with the new block -- no separate restore pass over the state. The block's raw k, v, g, beta are kept by the kernel
+    in a two-half buffer (half par this step, read next step). The per-row buffers join the engine's row tensors, so a
+    retired row's slot is refilled together with them; rows inserted since the last step (ctx_cnt == 0) skip the
+    pending replay. One snapshot slot per row. committed_bits 8 / 4: the committed state itself is kept quantised (per
+    channel) instead of fp32 -- smaller writes and reads every step, a quantisation in every round."""
+    committed_bits = 0
+
+    def __init__(self, engine, bs, block, slots=1):
+        super().__init__(engine, bs, block, slots=slots)
+        assert slots == 1 and self.bits in (32, 8, 4)
+        e, dev = engine, engine.dev
+        hv, kd, vd = e.rec[e.gdn[0]].shape[1:]
+        L, bf = len(e.gdn), torch.bfloat16
+        # one buffer per kind for all GDN layers (row-major in the batch row), so retiring a row moves 9 tensors
+        snap = torch.empty(bs, L, *self.snap_rec[e.gdn[0]].shape[1:], device=dev, dtype=self.snap_rec[e.gdn[0]].dtype)
+        self.snap_rec = {i: snap[:, li] for li, i in enumerate(e.gdn)}
+        self.bufs = [snap]
+        if self.snap_scale:
+            sc = torch.empty(bs, L, *self.snap_scale[e.gdn[0]].shape[1:], device=dev)
+            self.snap_scale = {i: sc[:, li] for li, i in enumerate(e.gdn)}
+            self.bufs.append(sc)
+        pk = torch.zeros(bs, L, 2, block, hv, kd, device=dev, dtype=bf)
+        pv = torch.zeros(bs, L, 2, block, hv, vd, device=dev, dtype=bf)
+        pg = torch.zeros(bs, L, 2, block, hv, device=dev)
+        pb = torch.zeros(bs, L, 2, block, hv, device=dev, dtype=bf)
+        self.pk, self.pv, self.pg, self.pb = ({i: x[:, li] for li, i in enumerate(e.gdn)} for x in (pk, pv, pg, pb))
+        self.pslot = torch.full((bs,), -1, dtype=torch.int32, device=dev)
+        self.poffs = torch.zeros(bs, dtype=torch.int32, device=dev)
+        self.plens = torch.zeros(bs, dtype=torch.int32, device=dev)
+        self.par = torch.zeros((), dtype=torch.int32, device=dev)
+        self.bufs += [pk, pv, pg, pb, self.pslot, self.poffs, self.plens]
+        self.cq = self.cqs = None
+        if self.committed_bits:                                      # quantised committed state instead of engine.rec
+            dt = torch.int16 if self.committed_bits == 8 else torch.uint8
+            cq = torch.empty(bs, L, hv, kd // 2, vd, device=dev, dtype=dt)
+            cqs = torch.empty(bs, L, hv, 1, vd, device=dev)
+            self.cq, self.cqs = ({i: x[:, li] for li, i in enumerate(e.gdn)} for x in (cq, cqs))
+            self.bufs += [cq, cqs]
+        rows_of = e._row_tensors
+        e._row_tensors = lambda: list(rows_of()) + self.bufs
+
+    def verify_gdn(self, i, q, k, v, g, beta, conv_full, n):
+        if i == self.eng.gdn[0]:                                     # once per step
+            self.rows32 = self.rows[:, 0].to(torch.int32).contiguous()
+            self.fresh32 = (self.eng.ctx_cnt[:n] == 0).to(torch.int32)
+        o = gdn_verify_deferred(q, k, v, g, beta, self.eng.rec[i][:n], self.snap_rec[i][:n], self.rows32,
+                                self.pk[i][:n], self.pv[i][:n], self.pg[i][:n], self.pb[i][:n], self.par,
+                                self.pslot[:n], self.poffs[:n], self.plens[:n], self.fresh32,
+                                self.snap_scale[i][:n] if self.snap_scale else None,
+                                self.cq[i][:n] if self.cq else None, self.cqs[i][:n] if self.cq else None)
+        self.conv_full[i] = conv_full
+        if self.capture is not None:
+            self.capture[i] = (q, k, v, g, beta)
+        return o
+
+    def restore(self, produced, n, accepted=None):
+        dev = produced.device
+        last = (produced - 1)[:, None]
+        cand = torch.where((self.rows >= 0) & (self.rows <= last), self.rows, -1)
+        best, slot = cand.max(1)
+        have = best >= 0
+        offs = torch.where(have, best + 1, 0)
+        lens = produced - offs
+        self.pslot[:n].copy_(torch.where(have, slot, -1))
+        self.poffs[:n].copy_(offs)
+        self.plens[:n].copy_(lens)
+        km1 = self.eng.conv[self.eng.gdn[0]].shape[-1]
+        widx = (produced[:, None] + torch.arange(km1, device=dev)[None])[:, None, :]
+        for i, full in self.conv_full.items():
+            torch.gather(full, 2, widx.expand(-1, full.shape[1], -1), out=self.eng.conv[i][:n])
+        self.conv_full = {}
+        self.par.copy_(1 - self.par)
+        valid = torch.arange(n, device=dev) < self.eng.n_dev
+        vl = valid.long()
+        self.stat["n"] += vl.sum()
+        self.stat["hit"] += ((lens == 0) & valid).sum()
+        self.stat["from_s0"] += ((~have) & valid).sum()
+        self.stat["replay"] += (lens * vl).sum()
+        self.stat["replay_hist"].index_add_(0, lens, vl)
+
+    def pred_stats(self):
+        return dict(super().pred_stats(), deferred_restore=True, committed_bits=self.committed_bits)
+
+
+class HistCostDeferred(HistCostStatic, _Deferred):
+    name = "hist_dq8"
+
+
+class SoftmaxCostDeferred(SoftmaxCostStatic, _Deferred):
+    name = "confsm_dq8"
+
+
+class HeadCostDeferred(HeadCostStatic, _Deferred):
+    name = "confhead_dq8"
+
+
+class OracleDeferredQ8(OracleSlotStatic, _Deferred):
+    name = "oracle_dq8"
+    bits = 8
+
+
+class HistCostDeferred4(HistCostDeferred):
+    name = "hist_dq4"
+    bits = 4
+
+
+class SoftmaxCostDeferred4(SoftmaxCostDeferred):
+    name = "confsm_dq4"
+    bits = 4
+
+
+class HeadCostDeferred4(HeadCostDeferred):
+    name = "confhead_dq4"
+    bits = 4
+
+
+class OracleDeferredQ4(OracleSlotStatic, _Deferred):
+    name = "oracle_dq4"
+    bits = 4
+
+
+class OracleDeferredQ8C(OracleDeferredQ8):
+    name = "oracle_dq8c"
+    committed_bits = 8
+
+
+class SoftmaxCostDeferredC(SoftmaxCostDeferred):
+    name = "confsm_dq8c"
+    committed_bits = 8
+
+
+class HistCostDeferredC(HistCostDeferred):
+    name = "hist_dq8c"
+    committed_bits = 8
+
+
+class OracleDeferredQ4C(OracleDeferredQ4):
+    name = "oracle_dq4c"
+    committed_bits = 4
+
+
+class SoftmaxCostDeferred4C(SoftmaxCostDeferred4):
+    name = "confsm_dq4c"
+    committed_bits = 4
+
+
+class HistCostDeferred4C(HistCostDeferred4):
+    name = "hist_dq4c"
+    committed_bits = 4
+
+
+class SoftmaxCostDeferred32(SoftmaxCostDeferred):
+    name = "confsm_d32"
+    bits = 32
+
+
+class OracleDeferred32(OracleSlotStatic, _Deferred):
+    """fp32 snapshots: outputs must equal SpecLA's token for token (correctness check of the deferral)."""
+    name = "oracle_d32"
+
 ROLLBACKS = {"fullstate": FullStateRollback, "modeal": ModeALRollback, "specla": SpecLARollback,
              "confk": ConfKRollback, "confkb": ConfKBRollback, "oracle": OracleRollback}
 STATIC_ROLLBACKS = {"fullstate": FullStateRollback, "modeal": ModeALStatic, "specla": SpecLARollback,
                     "confk": ConfKStatic, "confkb": ConfKBStatic, "oracle": OracleStatic,
-                    "oracle_copy": OracleCopyStatic}                                          # CUDA-graph capturable
+                    "oracle_copy": OracleCopyStatic, "fixed": FixedSlotsStatic, "fixed_q4": FixedSlotsQ4,
+                    "oracle_fused": OracleSlotStatic, "oracle_fused_q4": OracleSlotQ4, "fixed_q8": FixedSlotsQ8,
+                    "oracle_fused_q8": OracleSlotQ8, "hist_q8": HistCostStatic, "confsm_q8": SoftmaxCostStatic,
+                    "confhead_q8": HeadCostStatic, "hist_dq8": HistCostDeferred, "confsm_dq8": SoftmaxCostDeferred,
+                    "confhead_dq8": HeadCostDeferred, "oracle_dq8": OracleDeferredQ8,
+                    "oracle_d32": OracleDeferred32, "hist_dq4": HistCostDeferred4, "confsm_dq4": SoftmaxCostDeferred4,
+                    "confhead_dq4": HeadCostDeferred4, "oracle_dq4": OracleDeferredQ4, "oracle_dq8c": OracleDeferredQ8C,
+                    "confsm_dq8c": SoftmaxCostDeferredC, "hist_dq8c": HistCostDeferredC,
+                    "confsm_d32": SoftmaxCostDeferred32, "oracle_dq4c": OracleDeferredQ4C,
+                    "confsm_dq4c": SoftmaxCostDeferred4C, "hist_dq4c": HistCostDeferred4C}  # CUDA-graph capturable
 
 
 def make_rollback(name, engine, bs, block, static=False, **kwargs):

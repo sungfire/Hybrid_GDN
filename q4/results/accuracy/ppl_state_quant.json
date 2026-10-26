@@ -1,0 +1,50 @@
+{
+ "dataset": "openai/gsm8k main test (question + answer)",
+ "seqs": 128,
+ "len": 1024,
+ "tokens": 130944,
+ "runs": {
+  "every6_fp32": {
+   "every": 6,
+   "bits": 32,
+   "ppl": 2.8599034442029803,
+   "nll": 1.050787863493665,
+   "rel_change_pct": 0.0
+  },
+  "every6_q8": {
+   "every": 6,
+   "bits": 8,
+   "ppl": 2.8604740892145113,
+   "nll": 1.050987376553805,
+   "rel_change_pct": 0.01995329641941712
+  },
+  "every6_q4": {
+   "every": 6,
+   "bits": 4,
+   "ppl": 2.9205476196756726,
+   "nll": 1.0717711396813976,
+   "rel_change_pct": 2.120497305446367
+  },
+  "every2_fp32": {
+   "every": 2,
+   "bits": 32,
+   "ppl": 2.859919212497791,
+   "nll": 1.0507933770544018,
+   "rel_change_pct": 0.0
+  },
+  "every2_q8": {
+   "every": 2,
+   "bits": 8,
+   "ppl": 2.861204622119664,
+   "nll": 1.0512427326987333,
+   "rel_change_pct": 0.04494566197030814
+  },
+  "every2_q4": {
+   "every": 2,
+   "bits": 4,
+   "ppl": 3.062239556077861,
+   "nll": 1.1191465293411402,
+   "rel_change_pct": 7.0743377189094625
+  }
+ }
+}

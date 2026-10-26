@@ -18,6 +18,7 @@ from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 from transformers import DynamicCache
 from transformers.models.qwen3_5 import modeling_qwen3_5 as M
 
+from .kernels import argmax_maxprob
 from .rollback import make_rollback
 
 
@@ -235,6 +236,9 @@ class Engine:
             x = x + layer.mlp(layer.post_attention_layernorm(x))
         hn = d.norm(x)[:, 1:]
         logits = d.compute_logits(hn, self.t.lm_head)
+        if need_conf == "fused":                        # argmax and its softmax probability in one pass (youngjoon)
+            tok, conf = argmax_maxprob(logits.flatten(0, 1))
+            return tok.view(B, S - 1), conf.view(B, S - 1)
         tok = logits.argmax(-1)
         if not need_conf:
             return tok, None

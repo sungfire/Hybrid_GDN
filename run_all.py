@@ -21,7 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from dflash_cb import checks
 from dflash_cb import env as envmod
-from dflash_cb.data import load_gsm8k_256
+from dflash_cb.data import load_gsm8k_256, load_nq, load_specbench
 from dflash_cb.engine import Engine, sync_time
 from dflash_cb.graph_engine import GraphEngine
 from dflash_cb.kernels import gdn_verify
@@ -30,8 +30,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def rb_kwargs(args):
-    if args.rollback in ("oracle", "oracle_copy"):
+    if args.rollback in ("oracle", "oracle_copy", "oracle_fused", "oracle_fused_q4", "oracle_fused_q8", "oracle_dq8",
+                         "oracle_d32", "oracle_dq4", "oracle_dq8c", "oracle_dq4c"):
         return dict(trace=args.oracle_from)
+    if args.rollback in ("fixed", "fixed_q4", "fixed_q8"):
+        return dict(als=[int(x) for x in args.slots.split(",")])
+    if args.rollback in ("hist_q8", "confsm_q8", "hist_dq8", "confsm_dq8", "hist_dq4", "confsm_dq4", "confsm_dq8c",
+                         "hist_dq8c", "confsm_d32", "confsm_dq4c", "hist_dq4c"):
+        return dict(cost_table=args.cost_table)
+    if args.rollback in ("confhead_q8", "confhead_dq8", "confhead_dq4"):
+        return dict(cost_table=args.cost_table, head=args.head)
     if args.rollback == "confkb":
         return dict(select=args.select, k=args.k, thr=args.thr, head=args.head)
     return dict(select=args.select, k=args.k, thr=args.thr) if args.rollback == "confk" else {}
@@ -43,6 +51,8 @@ def out_dir(args):
     tag = ("graph_" if args.engine == "graph" else "") + args.rollback
     if args.rollback in ("confk", "confkb"):
         tag += f"_top{args.k}" if args.select == "topk" else f"_thr{args.thr:g}"
+    if args.rollback in ("fixed", "fixed_q4", "fixed_q8"):
+        tag += "_s" + args.slots.replace(",", "-")
     return os.path.join(ROOT, f"results_{tag}")
 
 
@@ -319,9 +329,14 @@ def main():
     ap.add_argument("--engine", default="eager", choices=["eager", "graph"],
                     help="graph: CUDA-graph captured decode steps (results_graph_<rollback>)")
     ap.add_argument("--limit", type=int, default=None, help="use only the first N of the 256 questions (smoke tests)")
+    ap.add_argument("--gsm8k-all", action="store_true", help="all 1319 GSM8K test questions instead of the 256 subset")
+    ap.add_argument("--dataset", default="gsm8k", help="gsm8k (default), nq[:n] (NQ-open dev sample) or specbench:<category>, e.g. specbench:qa")
     ap.add_argument("--select", default="topk", choices=["topk", "thr"], help="confk: how snapshot rows are chosen")
     ap.add_argument("--k", type=int, default=1, help="confk topk: number of most likely stop rows to keep")
     ap.add_argument("--thr", type=float, default=0.5, help="confk thr: per-token confidence threshold")
+    ap.add_argument("--cost-table", default=os.path.join(ROOT, "q4/bench_cost_rtx3090.json"),
+                    help="hist_* / confsm_* / confhead_*: kernel times per batch size (q4/test_q4.py --full --json)")
+    ap.add_argument("--slots", default="6", help="fixed / fixed_q4 / fixed_q8: kept acceptance lengths, comma separated")
     ap.add_argument("--oracle-from", default=None,
                     help="oracle: results dir of the same engine whose raw/dflash_bs<B>_run1.jsonl AL traces to replay")
     ap.add_argument("--head", default=os.path.join(ROOT, "ext/confk_head_B/confk-head-B/heads/head_mlp.pt"),
@@ -353,7 +368,12 @@ def main():
         return cache["t"], cache["d"]
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    qids, prompts = load_gsm8k_256(ROOT, tok)
+    if args.dataset == "gsm8k":
+        qids, prompts = load_gsm8k_256(ROOT, tok, n=None if args.gsm8k_all else 256)
+    elif args.dataset.startswith("nq"):                    # nq or nq:<n>: NQ-open dev sample
+        qids, prompts = load_nq(ROOT, tok, n=int(args.dataset.split(":", 1)[1]) if ":" in args.dataset else 256)
+    else:                                                 # specbench:<category>, e.g. specbench:qa
+        qids, prompts = load_specbench(ROOT, tok, args.dataset.split(":", 1)[1])
     if args.limit:
         qids, prompts = qids[: args.limit], prompts[: args.limit]
     max_prompt = max(len(p) for p in prompts)
